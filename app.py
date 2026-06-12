@@ -37,6 +37,14 @@ from src.meteorology_analysis import (
     plot_param_correlation_heatmap
 )
 from src.report_generator import process_missing_data, generate_pdf_report
+from src.warning_engine import (
+    WARNING_LEVELS, OPERATORS, PARAM_NAMES_CN, AVAILABLE_PARAMS,
+    Condition, WarningRule, WarningEvent,
+    get_builtin_templates, make_unique_name, import_templates,
+    scan_warnings, events_to_dataframe,
+    compute_level_counts, compute_buoy_counts, compute_hourly_heatmap,
+    serialize_rules, deserialize_rules
+)
 
 st.set_page_config(page_title="海洋浮标数据质控与海况分析系统", layout="wide")
 st.title("🌊 海洋浮标观测数据质量控制与海况分析系统")
@@ -48,6 +56,12 @@ if 'qc_result' not in st.session_state:
     st.session_state.qc_result = None
 if 'data_overview' not in st.session_state:
     st.session_state.data_overview = None
+if 'warning_rules' not in st.session_state:
+    st.session_state.warning_rules = []
+if 'warning_events' not in st.session_state:
+    st.session_state.warning_events = None
+if 'warning_events_df' not in st.session_state:
+    st.session_state.warning_events_df = None
 
 
 st.sidebar.header("导航")
@@ -60,6 +74,7 @@ page = st.sidebar.radio("功能模块", [
     "🌤️ 气象分析",
     "📊 多浮标对比",
     "🔧 缺测处理",
+    "🚨 预警管理",
     "📄 报告生成"
 ])
 
@@ -599,6 +614,498 @@ elif page == "🔧 缺测处理":
                                             f"({gap['duration_hours']:.1f}小时)")
                                 if len(gaps) > 10:
                                     st.info(f"  ... 另有 {len(gaps) - 10} 个缺测段")
+
+elif page == "🚨 预警管理":
+    st.header("海况预警与事件管理")
+    tab_wr, tab_we, tab_ws = st.tabs(["⚙️ 预警规则管理", "📋 预警事件列表", "📊 预警统计仪表盘"])
+
+    with tab_wr:
+        st.subheader("预警规则列表")
+        col_imp1, col_imp2, col_imp3 = st.columns(3)
+        with col_imp1:
+            if st.button("📥 导入内置模板", type="primary"):
+                st.session_state.warning_rules = import_templates(st.session_state.warning_rules)
+                st.success("✅ 已导入3条内置模板规则")
+                st.rerun()
+        with col_imp2:
+            rule_export = serialize_rules(st.session_state.warning_rules)
+            st.download_button(
+                label="📤 导出规则(JSON)",
+                data=rule_export,
+                file_name="warning_rules.json",
+                mime="application/json"
+            )
+        with col_imp3:
+            uploaded_rules = st.file_uploader("📁 导入规则(JSON)", type=['json'], key="rule_import", label_visibility="collapsed")
+            if uploaded_rules is not None:
+                try:
+                    json_str = uploaded_rules.read().decode('utf-8')
+                    imported = deserialize_rules(json_str)
+                    if imported:
+                        existing_names = [r.name for r in st.session_state.warning_rules]
+                        for r in imported:
+                            r.name = make_unique_name(r.name, existing_names)
+                            existing_names.append(r.name)
+                        st.session_state.warning_rules = st.session_state.warning_rules + imported
+                        st.success(f"✅ 成功导入 {len(imported)} 条规则")
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"导入失败: {str(e)}")
+
+        rules = st.session_state.warning_rules
+        if len(rules) == 0:
+            st.info("暂无预警规则，请添加规则或导入内置模板")
+        else:
+            rule_rows = []
+            for idx, r in enumerate(rules):
+                level_info = WARNING_LEVELS.get(r.level, {})
+                rule_rows.append({
+                    '序号': idx + 1,
+                    '规则名称': r.name,
+                    '预警级别': level_info.get('name', f'L{r.level}'),
+                    '触发条件': r.describe_conditions(),
+                    '状态': '✅ 启用' if r.enabled else '⏸️ 禁用',
+                    'level_val': r.level,
+                    'color': level_info.get('color', '#888888')
+                })
+            display_df = pd.DataFrame(rule_rows)
+
+            def _style_rule_row(row):
+                bg = WARNING_LEVELS.get(row['level_val'], {}).get('bg_color', '#ffffff')
+                if row['状态'] == '⏸️ 禁用':
+                    bg = '#f5f5f5'
+                return [f'background-color:{bg}' for _ in row]
+
+            styled = display_df.style.apply(_style_rule_row, axis=1).hide(['level_val', 'color'], axis=1)
+            st.dataframe(styled, use_container_width=True, height=min(400, 80 + len(rule_rows) * 45))
+
+        st.divider()
+        col_add, col_edit, col_del, col_toggle = st.columns(4)
+        with col_add:
+            show_add = st.button("➕ 新增规则", key="show_add_rule")
+        with col_edit:
+            edit_disabled = len(rules) == 0
+            selected_edit_idx = st.selectbox(
+                "选择要编辑的规则",
+                range(len(rules)) if rules else [0],
+                format_func=lambda i: rules[i].name if rules else "-- 无规则 --",
+                key="edit_rule_select",
+                disabled=edit_disabled
+            )
+            show_edit = st.button("✏️ 编辑规则", key="show_edit_rule", disabled=edit_disabled)
+        with col_del:
+            del_disabled = len(rules) == 0
+            selected_del_idx = st.selectbox(
+                "选择要删除的规则",
+                range(len(rules)) if rules else [0],
+                format_func=lambda i: rules[i].name if rules else "-- 无规则 --",
+                key="del_rule_select",
+                disabled=del_disabled
+            )
+            confirm_del = st.button("🗑️ 删除规则", key="confirm_del_rule", disabled=del_disabled)
+            if confirm_del and len(rules) > 0:
+                del_name = rules[selected_del_idx].name
+                del st.session_state.warning_rules[selected_del_idx]
+                st.success(f"✅ 已删除规则: {del_name}")
+                st.rerun()
+        with col_toggle:
+            tog_disabled = len(rules) == 0
+            selected_tog_idx = st.selectbox(
+                "选择要切换的规则",
+                range(len(rules)) if rules else [0],
+                format_func=lambda i: rules[i].name if rules else "-- 无规则 --",
+                key="toggle_rule_select",
+                disabled=tog_disabled
+            )
+            toggle_btn = st.button("🔄 启用/禁用", key="toggle_rule_btn", disabled=tog_disabled)
+            if toggle_btn and len(rules) > 0:
+                st.session_state.warning_rules[selected_tog_idx].enabled = not st.session_state.warning_rules[selected_tog_idx].enabled
+                st.rerun()
+
+        def _render_rule_form(form_key, default_rule=None, is_edit=False):
+            default_name = default_rule.name if default_rule else ""
+            default_level = default_rule.level if default_rule else 1
+            default_duration = default_rule.duration_minutes if default_rule else 0
+            default_enabled = default_rule.enabled if default_rule else True
+            default_conditions = default_rule.conditions if default_rule else []
+
+            with st.form(form_key, clear_on_submit=True):
+                st.markdown("**规则基本信息**")
+                c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
+                new_name = c1.text_input("规则名称", value=default_name, placeholder="请输入唯一规则名称")
+                level_options = [1, 2, 3, 4]
+                level_labels = [f"{WARNING_LEVELS[l]['name']} (L{l})" for l in level_options]
+                new_level = c2.selectbox(
+                    "预警级别",
+                    range(len(level_options)),
+                    index=level_options.index(default_level) if default_level in level_options else 0,
+                    format_func=lambda i: level_labels[i]
+                )
+                new_duration = c3.number_input("持续时间(分钟)", min_value=0, max_value=1440, value=default_duration,
+                                                help="0表示无需持续，单条满足即触发")
+                new_enabled = c4.checkbox("启用规则", value=default_enabled)
+
+                st.markdown("**触发条件（所有条件需同时满足）**")
+                cond_count_key = f"{form_key}_cond_count"
+                if cond_count_key not in st.session_state:
+                    st.session_state[cond_count_key] = max(1, len(default_conditions))
+
+                def _change_cond_count(delta):
+                    st.session_state[cond_count_key] = max(1, min(10, st.session_state[cond_count_key] + delta))
+
+                cond_cols = st.columns([1, 1, 1, 2, 1, 1])
+                cond_cols[0].markdown("**序号**")
+                cond_cols[1].markdown("**参数**")
+                cond_cols[2].markdown("**比较符**")
+                cond_cols[3].markdown("**阈值**")
+                cond_cols[4].markdown("**操作**")
+                cond_cols[5].markdown("")
+
+                new_conditions = []
+                valid_form = True
+                for i in range(st.session_state[cond_count_key]):
+                    cc = st.columns([1, 1, 1, 2, 1, 1])
+                    cc[0].markdown(f"**{i+1}**")
+                    default_cond = default_conditions[i] if i < len(default_conditions) else None
+                    dp = default_cond.param if default_cond else AVAILABLE_PARAMS[0]
+                    if dp not in AVAILABLE_PARAMS:
+                        dp = AVAILABLE_PARAMS[0]
+                    p_idx = AVAILABLE_PARAMS.index(dp) if dp in AVAILABLE_PARAMS else 0
+                    cond_param = cc[1].selectbox(
+                        "参数", AVAILABLE_PARAMS, index=p_idx,
+                        format_func=lambda x: PARAM_NAMES_CN.get(x, x),
+                        key=f"{form_key}_p{i}", label_visibility="collapsed"
+                    )
+                    do = default_cond.operator if default_cond else ">"
+                    if do not in OPERATORS:
+                        do = ">"
+                    o_idx = OPERATORS.index(do) if do in OPERATORS else 0
+                    cond_op = cc[2].selectbox(
+                        "比较符", OPERATORS, index=o_idx,
+                        key=f"{form_key}_o{i}", label_visibility="collapsed"
+                    )
+                    dt = default_cond.threshold if default_cond else 0.0
+                    try:
+                        dt_val = float(dt)
+                    except (ValueError, TypeError):
+                        dt_val = 0.0
+                    cond_thresh = cc[3].number_input(
+                        "阈值", value=dt_val, format="%.4f",
+                        key=f"{form_key}_t{i}", label_visibility="collapsed"
+                    )
+                    new_conditions.append(Condition(param=cond_param, operator=cond_op, threshold=float(cond_thresh)))
+                    if i == st.session_state[cond_count_key] - 1:
+                        if cc[4].button("➕", key=f"{form_key}_add{i}", help="添加条件"):
+                            _change_cond_count(1)
+                            st.rerun()
+                    else:
+                        if cc[4].button("➖", key=f"{form_key}_del{i}", help="删除此条件"):
+                            _change_cond_count(-1)
+                            st.rerun()
+
+                st.divider()
+                submit_label = "💾 保存修改" if is_edit else "✅ 确认添加"
+                submitted = st.form_submit_button(submit_label, type="primary")
+                if submitted:
+                    if not new_name.strip():
+                        st.error("❌ 规则名称不能为空")
+                        valid_form = False
+                    else:
+                        existing_names = [r.name for j, r in enumerate(st.session_state.warning_rules)
+                                          if not is_edit or j != selected_edit_idx]
+                        if new_name.strip() in existing_names:
+                            st.error("❌ 规则名称已存在，请使用其他名称")
+                            valid_form = False
+
+                    if valid_form:
+                        level_val = level_options[new_level]
+                        new_rule = WarningRule(
+                            name=new_name.strip(),
+                            level=level_val,
+                            conditions=new_conditions,
+                            duration_minutes=int(new_duration),
+                            enabled=new_enabled
+                        )
+                        if is_edit:
+                            st.session_state.warning_rules[selected_edit_idx] = new_rule
+                            st.success(f"✅ 规则已更新: {new_name}")
+                        else:
+                            st.session_state.warning_rules.append(new_rule)
+                            st.success(f"✅ 规则已添加: {new_name}")
+                        if cond_count_key in st.session_state:
+                            del st.session_state[cond_count_key]
+                        st.rerun()
+
+        if show_add:
+            st.markdown("---")
+            st.subheader("➕ 新增预警规则")
+            _render_rule_form("add_rule_form", default_rule=None, is_edit=False)
+
+        if show_edit and len(rules) > 0:
+            st.markdown("---")
+            st.subheader(f"✏️ 编辑规则: {rules[selected_edit_idx].name}")
+            _render_rule_form("edit_rule_form", default_rule=rules[selected_edit_idx], is_edit=True)
+
+    with tab_we:
+        st.subheader("实时预警扫描")
+        col_scan1, col_scan2, col_scan3 = st.columns([1, 1, 3])
+        with col_scan1:
+            scan_btn = st.button("🚀 执行预警扫描", type="primary")
+        with col_scan2:
+            clear_btn = st.button("🗑️ 清空扫描结果")
+            if clear_btn:
+                st.session_state.warning_events = None
+                st.session_state.warning_events_df = None
+                st.rerun()
+        with col_scan3:
+            enabled_count = len([r for r in st.session_state.warning_rules if r.enabled])
+            st.info(f"当前已启用规则: {enabled_count}/{len(st.session_state.warning_rules)} 条")
+
+        if scan_btn:
+            if st.session_state.data is None:
+                st.error("❌ 请先在【数据导入】模块上传数据")
+            else:
+                data_to_scan = st.session_state.data.copy()
+                if st.session_state.qc_result is not None:
+                    qc_codes = st.session_state.qc_result.qc_codes
+                    if qc_codes is not None:
+                        pass
+                with st.spinner("正在执行预警扫描..."):
+                    events = scan_warnings(
+                        data_to_scan,
+                        st.session_state.warning_rules,
+                        st.session_state.qc_result.qc_codes if st.session_state.qc_result else None
+                    )
+                    st.session_state.warning_events = events
+                    st.session_state.warning_events_df = events_to_dataframe(events)
+                    st.success(f"✅ 扫描完成！共检测到 {len(events)} 个预警事件")
+
+        events_df = st.session_state.warning_events_df
+        if events_df is None or len(events_df) == 0:
+            if scan_btn:
+                st.info("未检测到任何预警事件")
+            else:
+                st.info("请点击【执行预警扫描】开始检测")
+        else:
+            st.success(f"共检测到 **{len(events_df)}** 个预警事件")
+            st.divider()
+            st.subheader("事件筛选")
+            col_f1, col_f2 = st.columns(2)
+            all_levels = ['全部'] + sorted(events_df['level'].unique().tolist())
+            level_labels = ['全部'] + [f"L{l} - {WARNING_LEVELS.get(l, {}).get('name', '')}" for l in all_levels if l != '全部']
+            with col_f1:
+                sel_level_idx = st.selectbox(
+                    "按预警级别筛选",
+                    range(len(all_levels)),
+                    format_func=lambda i: level_labels[i],
+                    key="event_filter_level"
+                )
+            all_buoys = ['全部'] + sorted(events_df['buoy_id'].unique().tolist())
+            with col_f2:
+                sel_buoy = st.selectbox(
+                    "按浮标筛选",
+                    all_buoys,
+                    key="event_filter_buoy"
+                )
+
+            filtered = events_df.copy()
+            if all_levels[sel_level_idx] != '全部':
+                filtered = filtered[filtered['level'] == all_levels[sel_level_idx]]
+            if sel_buoy != '全部':
+                filtered = filtered[filtered['buoy_id'] == sel_buoy]
+
+            if len(filtered) == 0:
+                st.warning("筛选条件下无事件")
+            else:
+                st.markdown(f"显示 **{len(filtered)}** 条事件")
+
+                def _row_style(row):
+                    lv = row['level']
+                    bg = WARNING_LEVELS.get(lv, {}).get('bg_color', '#ffffff')
+                    if lv >= 3:
+                        return [f'background-color:{bg};font-weight:bold' for _ in row]
+                    return [f'background-color:{bg}' for _ in row]
+
+                display = filtered.copy()
+                display['触发时间'] = display['start_time'].dt.strftime('%Y-%m-%d %H:%M')
+                display['结束时间'] = display['end_time'].dt.strftime('%Y-%m-%d %H:%M')
+                display['持续(分钟)'] = display['duration_minutes']
+                display['预警级别'] = display.apply(
+                    lambda r: f"{WARNING_LEVELS.get(r['level'], {}).get('name', '')}", axis=1
+                )
+                display['参数快照'] = display['param_snapshot'].apply(
+                    lambda d: " | ".join([f"{PARAM_NAMES_CN.get(k, k)}: {v:.2f}" if pd.notna(v) else f"{PARAM_NAMES_CN.get(k, k)}: N/A"
+                                          for k, v in d.items()])
+                )
+                show_cols = ['event_id', 'rule_name', '预警级别', 'buoy_id', '触发时间', '结束时间', '持续(分钟)', '参数快照']
+                show_cols_rename = {
+                    'event_id': '事件ID',
+                    'rule_name': '触发规则',
+                    'buoy_id': '浮标ID'
+                }
+                display_final = display[show_cols].rename(columns=show_cols_rename)
+                styled_final = display_final.style.apply(_row_style, axis=1)
+                st.dataframe(styled_final, use_container_width=True, height=500)
+
+                st.divider()
+                st.subheader("📜 事件卡片详情")
+                page_size = 10
+                total_pages = max(1, (len(filtered) - 1) // page_size + 1)
+                cp_col1, cp_col2, cp_col3 = st.columns([1, 3, 1])
+                current_page = cp_col2.slider("页码", 1, total_pages, 1, key="event_page")
+                start = (current_page - 1) * page_size
+                end = min(start + page_size, len(filtered))
+                page_data = filtered.iloc[start:end].reset_index(drop=True)
+                st.markdown(f"第 **{current_page}/{total_pages}** 页，显示 **{start+1}-{end}** 条")
+
+                for _, ev in page_data.iterrows():
+                    lv = int(ev['level'])
+                    level_info = WARNING_LEVELS.get(lv, {})
+                    color = level_info.get('color', '#888')
+                    bg = level_info.get('bg_color', '#fff')
+                    border_style = f'3px solid {color}' if lv >= 3 else f'1px solid {color}'
+                    param_html = ""
+                    for pk, pv in ev['param_snapshot'].items():
+                        cn_name = PARAM_NAMES_CN.get(pk, pk)
+                        val_str = f"{pv:.3f}" if pd.notna(pv) else "N/A"
+                        param_html += f'<span style="margin-right:18px;">{cn_name}: <b>{val_str}</b></span>'
+
+                    dur_str = f"{ev['duration_minutes']}分钟" if ev['duration_minutes'] > 0 else "瞬时触发"
+                    card = f"""
+                    <div style="border:{border_style};border-radius:10px;padding:16px;margin-bottom:12px;background:{bg};box-shadow:0 2px 4px rgba(0,0,0,0.05);">
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;flex-wrap:wrap;gap:8px;">
+                            <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+                                <span style="background:#333;color:white;padding:3px 10px;border-radius:5px;font-size:13px;font-weight:bold;">#{ev['event_id']}</span>
+                                <span style="font-weight:bold;font-size:16px;">{ev['rule_name']}</span>
+                                <span style="background:{color};color:white;padding:3px 12px;border-radius:5px;font-size:13px;font-weight:bold;">{level_info.get('name', '')}预警</span>
+                                <span style="background:#666;color:white;padding:3px 10px;border-radius:5px;font-size:12px;">🚩 {ev['buoy_id']}</span>
+                            </div>
+                        </div>
+                        <div style="display:flex;gap:24px;font-size:14px;margin-bottom:10px;flex-wrap:wrap;">
+                            <span>⏰ 开始: <b>{ev['start_time'].strftime('%Y-%m-%d %H:%M:%S')}</b></span>
+                            <span>⏱️ 结束: <b>{ev['end_time'].strftime('%Y-%m-%d %H:%M:%S')}</b></span>
+                            <span>📏 持续: <b>{dur_str}</b></span>
+                        </div>
+                        <div style="font-size:13px;padding-top:8px;border-top:1px dashed #ccc;">
+                            📊 触发时参数: {param_html}
+                        </div>
+                    </div>
+                    """
+                    st.markdown(card, unsafe_allow_html=True)
+
+    with tab_ws:
+        st.subheader("预警统计仪表盘")
+        stats_df = st.session_state.warning_events_df
+        if stats_df is None or len(stats_df) == 0:
+            st.info("暂无统计数据，请先在【预警事件列表】中执行扫描")
+        else:
+            sc1, sc2, sc3, sc4, sc5 = st.columns(5)
+            total = len(stats_df)
+            red_count = len(stats_df[stats_df['level'] == 4])
+            orange_count = len(stats_df[stats_df['level'] == 3])
+            yellow_count = len(stats_df[stats_df['level'] == 2])
+            blue_count = len(stats_df[stats_df['level'] == 1])
+            sc1.metric("🚨 总预警数", total)
+            sc2.metric("🔴 红色", red_count)
+            sc3.metric("🟠 橙色", orange_count)
+            sc4.metric("🟡 黄色", yellow_count)
+            sc5.metric("🔵 蓝色", blue_count)
+
+            st.divider()
+            chart_col1, chart_col2 = st.columns(2)
+
+            with chart_col1:
+                st.markdown("**各级别预警数量分布**")
+                level_counts = compute_level_counts(stats_df)
+                if len(level_counts) > 0:
+                    level_counts['label'] = level_counts.apply(
+                        lambda r: f"L{r['level']} {r['level_name']}", axis=1
+                    )
+                    level_counts['color'] = level_counts['level'].map(
+                        lambda l: WARNING_LEVELS.get(int(l), {}).get('color', '#999')
+                    )
+                    fig_pie = go.Figure(data=[go.Pie(
+                        labels=level_counts['label'],
+                        values=level_counts['count'],
+                        marker_colors=level_counts['color'].tolist(),
+                        textinfo='label+percent+value',
+                        hole=0.4,
+                        sort=False
+                    )])
+                    fig_pie.update_layout(height=420, showlegend=True,
+                                          legend=dict(orientation="h", yanchor="bottom", y=-0.1, xanchor="center", x=0.5))
+                    st.plotly_chart(fig_pie, use_container_width=True)
+                else:
+                    st.info("无数据")
+
+            with chart_col2:
+                st.markdown("**各浮标预警频次**")
+                buoy_counts = compute_buoy_counts(stats_df)
+                if len(buoy_counts) > 0:
+                    bar_colors = []
+                    for _, row in buoy_counts.iterrows():
+                        bid = row['buoy_id']
+                        buoy_df = stats_df[stats_df['buoy_id'] == bid]
+                        max_lv = buoy_df['level'].max()
+                        bar_colors.append(WARNING_LEVELS.get(int(max_lv), {}).get('color', '#4A90D9'))
+
+                    fig_bar = go.Figure(data=[go.Bar(
+                        x=buoy_counts['buoy_id'],
+                        y=buoy_counts['count'],
+                        marker_color=bar_colors,
+                        text=buoy_counts['count'],
+                        textposition='outside',
+                        hovertemplate='浮标: %{x}<br>预警次数: %{y}<extra></extra>'
+                    )])
+                    fig_bar.update_layout(height=420,
+                                          xaxis_title="浮标ID",
+                                          yaxis_title="预警次数",
+                                          yaxis=dict(rangemode='tozero'))
+                    st.plotly_chart(fig_bar, use_container_width=True)
+                else:
+                    st.info("无数据")
+
+            st.divider()
+            st.markdown("**24小时内预警时间分布热力图**")
+            all_buoys = sorted(stats_df['buoy_id'].unique().tolist()) if 'buoy_id' in stats_df.columns else []
+            heatmap_df = compute_hourly_heatmap(stats_df, all_buoys)
+            if len(heatmap_df) > 0:
+                fig_heat = go.Figure(data=go.Heatmap(
+                    z=heatmap_df.values,
+                    x=[f"{h:02d}:00" for h in range(24)],
+                    y=heatmap_df.index.tolist(),
+                    colorscale='Reds',
+                    showscale=True,
+                    hoverongaps=False,
+                    text=[[str(int(v)) if pd.notna(v) else "0" for v in row] for row in heatmap_df.values],
+                    texttemplate="%{text}",
+                    hovertemplate='浮标: %{y}<br>时段: %{x}<br>预警次数: %{z}<extra></extra>'
+                ))
+                max_val = int(heatmap_df.values.max()) if len(heatmap_df) > 0 else 0
+                if max_val <= 5:
+                    tick_vals = list(range(max_val + 1))
+                else:
+                    tick_vals = list(range(0, max_val + 1, max(1, max_val // 5)))
+                fig_heat.update_layout(
+                    height=max(300, 80 + len(heatmap_df) * 45),
+                    xaxis_title="时段",
+                    yaxis_title="浮标ID",
+                    xaxis=dict(dtick=2),
+                    coloraxis_colorbar=dict(
+                        title="预警次数",
+                        tickvals=tick_vals,
+                        ticktext=[str(v) for v in tick_vals]
+                    )
+                )
+                st.plotly_chart(fig_heat, use_container_width=True)
+
+                with st.expander("📋 查看热力图数据明细"):
+                    display_heat = heatmap_df.copy()
+                    display_heat.columns = [f"{h:02d}时" for h in range(24)]
+                    display_heat.index.name = "浮标ID"
+                    st.dataframe(display_heat.style.background_gradient(cmap='Reds', axis=None), use_container_width=True)
+            else:
+                st.info("无数据")
 
 elif page == "📄 报告生成":
     st.header("PDF海况分析报告")
