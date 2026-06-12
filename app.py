@@ -47,7 +47,8 @@ from src.warning_engine import (
     apply_escalation, build_composite_groups,
     detect_cycle_dependency, get_prerequisite_chain,
     compute_daily_trend, compute_daily_totals,
-    compute_7day_moving_avg, detect_anomaly_days
+    compute_7day_moving_avg, detect_anomaly_days,
+    topo_sort_rules
 )
 
 st.set_page_config(page_title="海洋浮标数据质控与海况分析系统", layout="wide")
@@ -68,6 +69,8 @@ if 'warning_events_df' not in st.session_state:
     st.session_state.warning_events_df = None
 if 'warning_composite_groups' not in st.session_state:
     st.session_state.warning_composite_groups = []
+if 'warning_escalation_state' not in st.session_state:
+    st.session_state.warning_escalation_state = {}
 
 
 st.sidebar.header("导航")
@@ -893,6 +896,7 @@ elif page == "🚨 预警管理":
                 st.session_state.warning_events = None
                 st.session_state.warning_events_df = None
                 st.session_state.warning_composite_groups = []
+                st.session_state.warning_escalation_state = {}
                 st.rerun()
         with col_scan3:
             enabled_count = len([r for r in st.session_state.warning_rules if r.enabled])
@@ -913,7 +917,14 @@ elif page == "🚨 预警管理":
                         st.session_state.warning_rules,
                         st.session_state.qc_result.qc_codes if st.session_state.qc_result else None
                     )
-                    events = apply_escalation(events, st.session_state.warning_rules)
+                    all_buoys = data_to_scan['buoy_id'].unique().tolist()
+                    events, new_state = apply_escalation(
+                        events,
+                        st.session_state.warning_rules,
+                        all_buoys,
+                        st.session_state.warning_escalation_state
+                    )
+                    st.session_state.warning_escalation_state = new_state
                     events, composite_groups = build_composite_groups(events)
                     st.session_state.warning_events = events
                     st.session_state.warning_events_df = events_to_dataframe(events)
@@ -1014,28 +1025,37 @@ elif page == "🚨 预警管理":
                         time_range = f"{grp['start_time'].strftime('%Y-%m-%d %H:%M')} ~ {grp['end_time'].strftime('%Y-%m-%d %H:%M')}"
                         title = f"{grp['group_id']} | {max_lv_name}预警 | {grp['rule_count']}条规则 | {time_range}"
                         with st.expander(f"🔗 {title}"):
-                            for sub_ev in grp['events']:
-                                sub_lv = sub_ev.effective_level
-                                sub_lv_info = WARNING_LEVELS.get(sub_lv, {})
+                            member_dicts = grp.get('events_dicts', [])
+                            for sub in member_dicts:
+                                sub_lv = sub.get('effective_level', sub.get('level', 1))
+                                sub_lv_info = WARNING_LEVELS.get(int(sub_lv), {})
                                 sub_color = sub_lv_info.get('color', '#888')
                                 sub_bg = sub_lv_info.get('bg_color', '#fff')
-                                tag_str = sub_ev.level_tag
+                                tag_str = sub.get('level_tag', '')
+                                param_snap = sub.get('param_snapshot', {}) or {}
                                 param_html = ""
-                                for pk, pv in sub_ev.param_snapshot.items():
+                                for pk, pv in param_snap.items():
                                     cn_name = PARAM_NAMES_CN.get(pk, pk)
-                                    val_str = f"{pv:.3f}" if pd.notna(pv) else "N/A"
+                                    try:
+                                        val_str = f"{float(pv):.3f}" if pv is not None and pd.notna(pv) else "N/A"
+                                    except (ValueError, TypeError):
+                                        val_str = str(pv) if pv is not None else "N/A"
                                     param_html += f'<span style="margin-right:12px;">{cn_name}: <b>{val_str}</b></span>'
-                                dur_str = f"{sub_ev.duration_minutes}分钟" if sub_ev.duration_minutes > 0 else "瞬时触发"
+                                dur_min = sub.get('duration_minutes', 0)
+                                dur_str = f"{dur_min}分钟" if dur_min > 0 else "瞬时触发"
+                                start_t = sub.get('start_time')
+                                start_str = start_t.strftime('%Y-%m-%d %H:%M') if start_t is not None and hasattr(start_t, 'strftime') else str(start_t)
+                                rule_name = sub.get('rule_name', '')
                                 sub_card = f"""
                                 <div style="border:1px solid {sub_color};border-radius:8px;padding:12px;margin-bottom:8px;background:{sub_bg};">
                                     <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-                                        <span style="font-weight:bold;">{sub_ev.rule_name}</span>
+                                        <span style="font-weight:bold;">{rule_name}</span>
                                         <span style="background:{sub_color};color:white;padding:2px 8px;border-radius:4px;font-size:12px;">{sub_lv_info.get('name', '')}</span>
                                         <span style="background:#e0e0e0;color:#333;padding:2px 8px;border-radius:4px;font-size:12px;">{tag_str}</span>
-                                        <span style="font-size:13px;">⏰ {sub_ev.start_time.strftime('%Y-%m-%d %H:%M')}</span>
+                                        <span style="font-size:13px;">⏰ {start_str}</span>
                                         <span style="font-size:13px;">📏 {dur_str}</span>
                                     </div>
-                                    <div style="font-size:12px;margin-top:6px;">📊 {param_html}</div>
+                                    <div style="font-size:12px;margin-top:6px;">📊 {param_html if param_html else '无参数快照'}</div>
                                 </div>
                                 """
                                 st.markdown(sub_card, unsafe_allow_html=True)

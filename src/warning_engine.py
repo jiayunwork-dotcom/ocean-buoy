@@ -272,6 +272,31 @@ def _check_prerequisite_triggered(
     return False
 
 
+def topo_sort_rules(rules: List[WarningRule]) -> List[WarningRule]:
+    rule_map = {r.name: r for r in rules}
+    result = []
+    visited = set()
+    visiting = set()
+
+    def _visit(name: str):
+        if name in visited:
+            return
+        if name in visiting:
+            return
+        visiting.add(name)
+        rule = rule_map.get(name)
+        if rule and rule.prerequisite_rule and rule.prerequisite_rule in rule_map:
+            _visit(rule.prerequisite_rule)
+        visiting.discard(name)
+        visited.add(name)
+        if rule:
+            result.append(rule)
+
+    for r in rules:
+        _visit(r.name)
+    return result
+
+
 def scan_warnings(
     data: pd.DataFrame,
     rules: List[WarningRule],
@@ -283,6 +308,8 @@ def scan_warnings(
     enabled_rules = [r for r in rules if r.enabled and len(r.conditions) > 0]
     if not enabled_rules:
         return []
+
+    enabled_rules = topo_sort_rules(enabled_rules)
 
     events = []
     event_id_counter = 1
@@ -298,7 +325,6 @@ def scan_warnings(
             data[col] = np.nan
 
     buoy_ids = data['buoy_id'].unique()
-    rule_names_with_prereq = {r.name: r.prerequisite_rule for r in enabled_rules}
 
     base_events_by_buoy_rule: Dict[Tuple[str, str], List[WarningEvent]] = {}
 
@@ -461,54 +487,74 @@ def scan_warnings(
     return events
 
 
-def apply_escalation(events: List[WarningEvent], rules: List[WarningRule]) -> List[WarningEvent]:
-    if not events:
-        return events
+def apply_escalation(
+    events: List[WarningEvent],
+    rules: List[WarningRule],
+    all_buoys: List[str],
+    persisted_state: Optional[Dict[Tuple[str, str], Dict]] = None
+) -> Tuple[List[WarningEvent], Dict[Tuple[str, str], Dict]]:
+    if persisted_state is None:
+        persisted_state = {}
 
+    new_state: Dict[Tuple[str, str], Dict] = {}
     rule_level_map = {r.name: r.level for r in rules}
 
+    rule_names = [r.name for r in rules]
+    all_keys: List[Tuple[str, str]] = []
+    for b in all_buoys:
+        for rn in rule_names:
+            all_keys.append((b, rn))
+
     from collections import defaultdict
-    groups = defaultdict(list)
+    event_groups = defaultdict(list)
     for ev in events:
-        groups[(ev.buoy_id, ev.rule_name)].append(ev)
+        event_groups[(ev.buoy_id, ev.rule_name)].append(ev)
 
-    for key, group_events in groups.items():
-        group_events.sort(key=lambda e: e.start_time)
-        original_level = rule_level_map.get(key[1], group_events[0].level if group_events else 1)
-        escalation_offset = 0
-        miss_count = 0
+    for key in all_keys:
+        buoy_id, rule_name = key
+        original_level = rule_level_map.get(rule_name, 1)
+        old = persisted_state.get(key, {'escalation_offset': 0, 'miss_scan_count': 0})
+        offset = int(old.get('escalation_offset', 0))
+        miss_count = int(old.get('miss_scan_count', 0))
 
-        for i, ev in enumerate(group_events):
-            if i > 0:
-                prev_ev = group_events[i - 1]
-                prev_dur = max(prev_ev.duration_minutes, 1)
-                gap_minutes = (ev.start_time - prev_ev.end_time).total_seconds() / 60
+        group_events = event_groups.get(key, [])
 
-                if gap_minutes <= prev_dur * 2:
-                    escalation_offset = min(escalation_offset + 1, 4 - original_level)
-                    miss_count = 0
+        if len(group_events) == 0:
+            miss_count += 1
+            if miss_count >= 3:
+                offset = max(0, offset - 1)
+                miss_count = 0
+        else:
+            miss_count = 0
+            group_events.sort(key=lambda e: e.start_time)
+            last_ev = None
+            for i, ev in enumerate(group_events):
+                if i > 0 and last_ev is not None:
+                    prev_dur = max(last_ev.duration_minutes, 1)
+                    gap_min = (ev.start_time - last_ev.end_time).total_seconds() / 60
+                    if gap_min <= prev_dur * 2:
+                        offset = min(offset + 1, 4 - original_level)
+                last_ev = ev
+
+            effective = min(original_level + offset, 4)
+            for ev in group_events:
+                ev.effective_level = effective
+                if effective > original_level:
+                    ev.level_tag = "↑升级"
                 else:
-                    miss_count += 1
-                    if miss_count >= 3:
-                        escalation_offset = max(0, escalation_offset - 1)
-                        miss_count = 0
+                    ev.level_tag = "↓原始"
 
-            effective = min(original_level + escalation_offset, 4)
-            ev.effective_level = effective
-            if effective > original_level:
-                ev.level_tag = "↑升级"
-            else:
-                ev.level_tag = "↓原始"
-
-        if not group_events:
-            continue
+        new_state[key] = {
+            'escalation_offset': offset,
+            'miss_scan_count': miss_count
+        }
 
     for ev in events:
         if ev.effective_level == 0:
             ev.effective_level = ev.level
             ev.level_tag = "↓原始"
 
-    return events
+    return events, new_state
 
 
 def build_composite_groups(events: List[WarningEvent]) -> Tuple[List[WarningEvent], List[Dict]]:
@@ -558,6 +604,21 @@ def build_composite_groups(events: List[WarningEvent]) -> Tuple[List[WarningEven
                 for idx in group_members:
                     buoy_evts[idx].group_id = gid
 
+                member_dicts = []
+                for e in member_events:
+                    member_dicts.append({
+                        'event_id': e.event_id,
+                        'rule_name': e.rule_name,
+                        'level': e.level,
+                        'effective_level': e.effective_level,
+                        'level_tag': e.level_tag,
+                        'buoy_id': e.buoy_id,
+                        'start_time': e.start_time,
+                        'end_time': e.end_time,
+                        'duration_minutes': e.duration_minutes,
+                        'param_snapshot': e.param_snapshot.copy() if e.param_snapshot else {}
+                    })
+
                 composite_groups.append({
                     'group_id': gid,
                     'buoy_id': buoy_id,
@@ -566,7 +627,8 @@ def build_composite_groups(events: List[WarningEvent]) -> Tuple[List[WarningEven
                     'rule_names': rule_names,
                     'start_time': min_time,
                     'end_time': max_time,
-                    'events': member_events
+                    'events': member_events,
+                    'events_dicts': member_dicts
                 })
 
     return events, composite_groups
