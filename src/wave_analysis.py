@@ -4,6 +4,7 @@ from scipy import signal
 from typing import Dict, Tuple, Optional, List
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
+import plotly.graph_objects as go
 
 from .plot_utils import setup_chinese_font
 setup_chinese_font()
@@ -147,3 +148,69 @@ def analyze_wave_buoy(df: pd.DataFrame, buoy_id: str, qc_mask: Optional[pd.Serie
     except ValueError as e:
         result['error'] = str(e)
     return result
+
+
+def compute_wave_monthly_stats(df: pd.DataFrame, buoy_id: str, qc_mask: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    buoy_df = df[df['buoy_id'] == buoy_id].sort_values('time').copy()
+    if 'Hs' not in buoy_df.columns:
+        return pd.DataFrame()
+    hs = buoy_df['Hs'].copy()
+    if qc_mask is not None:
+        hs_qc = qc_mask[qc_mask['buoy_id'] == buoy_id].sort_values('time')
+        hs = hs.reset_index(drop=True)
+        hs_qc = hs_qc.reset_index(drop=True)
+        if len(hs) == len(hs_qc):
+            hs[hs_qc['Hs'].isin([2, 3, 4])] = np.nan
+    buoy_df['Hs_valid'] = hs.values
+    buoy_df['year_month'] = buoy_df['time'].dt.to_period('M')
+    monthly = buoy_df.groupby('year_month').agg(
+        avg_hs=('Hs_valid', 'mean'),
+        max_hs=('Hs_valid', 'max'),
+        std_hs=('Hs_valid', 'std'),
+        valid_count=('Hs_valid', 'count'),
+        over_2m_count=('Hs_valid', lambda x: (x > 2).sum())
+    ).reset_index()
+    monthly['valid_days'] = buoy_df.groupby('year_month')['time'].apply(
+        lambda x: x.dt.date.nunique()
+    ).values
+    monthly['over_2m_ratio'] = monthly['over_2m_count'] / monthly['valid_count'].where(monthly['valid_count'] > 0, 1)
+    monthly['year_month_str'] = monthly['year_month'].astype(str)
+    monthly = monthly.rename(columns={
+        'year_month_str': '月份',
+        'avg_hs': '平均波高(m)',
+        'max_hs': '最大波高(m)',
+        'std_hs': '波高标准差(m)',
+        'valid_days': '有效数据天数',
+        'over_2m_ratio': '超过2m天数占比'
+    })
+    result = monthly[['月份', '平均波高(m)', '最大波高(m)', '波高标准差(m)', '有效数据天数', '超过2m天数占比']].copy()
+    result = result.reset_index(drop=True)
+    return result
+
+
+def plot_wave_monthly_bar(monthly_stats: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    x_labels = monthly_stats['月份'].tolist()
+    fig.add_trace(go.Bar(
+        x=x_labels,
+        y=monthly_stats['平均波高(m)'].tolist(),
+        error_y=dict(
+            type='data',
+            array=monthly_stats['波高标准差(m)'].fillna(0).tolist(),
+            visible=True,
+            color='#888'
+        ),
+        marker_color='rgba(31, 119, 180, 0.8)',
+        name='平均波高',
+        hovertemplate='%{x}<br>平均波高: %{y:.3f} m<br>标准差: %{error_y.array:.3f} m<extra></extra>'
+    ))
+    fig.update_layout(
+        title='月度平均波高统计',
+        xaxis_title='月份',
+        yaxis_title='平均波高 (m)',
+        xaxis_tickangle=-45,
+        template='plotly_white',
+        height=500,
+        showlegend=False
+    )
+    return fig

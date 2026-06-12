@@ -12,6 +12,18 @@ from .quality_control import (
     QC_UNCHECKED, QC_GOOD, QC_SUSPECT, QC_ERROR, QC_MISSING, QC_INTERPOLATED, PARAMETERS
 )
 
+PARAM_NAMES_CN = {
+    'wind_speed': '风速', 'wind_dir': '风向', 'air_temp': '气温',
+    'pressure': '气压', 'Hs': '有效波高', 'Tz': '平均波周期',
+    'wave_dir': '波向', 'SST': '海表温度', 'salinity': '盐度',
+    'current_speed': '流速', 'current_dir': '流向'
+}
+
+QC_LEVEL_NAMES = {
+    1: '范围检查', 2: '时间一致性', 3: '内部一致性',
+    4: '气候学检查', 5: '尖峰检测', 6: '卡值检测', 7: '空间一致性'
+}
+
 QC_COLORS = {
     QC_UNCHECKED: 'gray',
     QC_GOOD: 'green',
@@ -145,3 +157,41 @@ def apply_batch_override(qc_result, buoy_id: str, start_time: pd.Timestamp,
             key = (buoy_id, row['time'], param)
             qc_result.manual_overrides[key] = (new_code, reason)
     return qc_result
+
+
+def extract_error_events(df: pd.DataFrame, qc_result) -> pd.DataFrame:
+    events = []
+    qc_codes = qc_result.qc_codes
+    level_marks = qc_result.level_marks
+    manual_overrides = qc_result.manual_overrides
+    
+    for idx in range(len(qc_codes)):
+        row = qc_codes.iloc[idx]
+        buoy_id = row['buoy_id']
+        time = row['time']
+        df_row = df[(df['buoy_id'] == buoy_id) & (df['time'] == time)]
+        if len(df_row) == 0:
+            continue
+        df_row = df_row.iloc[0]
+        for param in PARAMETERS:
+            if param not in qc_codes.columns:
+                continue
+            final_code = qc_result.get_final_code(buoy_id, time, param)
+            if final_code != QC_ERROR:
+                continue
+            mark_level = qc_result.get_mark_level(buoy_id, time, param)
+            original_value = df_row[param] if param in df_row.index else None
+            events.append({
+                'time': time,
+                'buoy_id': buoy_id,
+                'param': param,
+                'param_name': PARAM_NAMES_CN.get(param, param),
+                'original_value': original_value,
+                'qc_level': mark_level if mark_level > 0 else None,
+                'qc_level_name': QC_LEVEL_NAMES.get(mark_level, '未知') if mark_level > 0 else '未知'
+            })
+    
+    events_df = pd.DataFrame(events)
+    if len(events_df) > 0:
+        events_df = events_df.sort_values('time', ascending=False).reset_index(drop=True)
+    return events_df

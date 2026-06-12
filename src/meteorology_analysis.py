@@ -4,9 +4,17 @@ from typing import Dict, Tuple, Optional, List
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 import matplotlib.cm as cm
+import plotly.graph_objects as go
 
 from .plot_utils import setup_chinese_font
 setup_chinese_font()
+
+PARAM_NAMES_CN = {
+    'wind_speed': '风速', 'wind_dir': '风向', 'air_temp': '气温',
+    'pressure': '气压', 'Hs': '有效波高', 'Tz': '平均波周期',
+    'wave_dir': '波向', 'SST': '海表温度', 'salinity': '盐度',
+    'current_speed': '流速', 'current_dir': '流向'
+}
 
 
 def wind_rose(wind_speed: np.ndarray, wind_dir: np.ndarray, n_sectors: int = 16,
@@ -180,3 +188,60 @@ def analyze_meteorology_buoy(df: pd.DataFrame, buoy_id: str, qc_mask: Optional[p
         temp_df['air_temp'] = at
         result['temp_diurnal'] = plot_diurnal_variation(temp_df, 'air_temp')
     return result
+
+
+def plot_param_correlation_heatmap(df: pd.DataFrame, buoy_id: str, qc_mask: Optional[pd.DataFrame] = None) -> go.Figure:
+    buoy_df = df[df['buoy_id'] == buoy_id].sort_values('time').copy()
+    numeric_cols = []
+    for col in buoy_df.columns:
+        if col in ['time', 'buoy_id']:
+            continue
+        if pd.api.types.is_numeric_dtype(buoy_df[col]):
+            numeric_cols.append(col)
+    if not numeric_cols:
+        return go.Figure()
+    if qc_mask is not None:
+        qc_buoy = qc_mask[qc_mask['buoy_id'] == buoy_id].sort_values('time').reset_index(drop=True)
+        buoy_df = buoy_df.reset_index(drop=True)
+        if len(buoy_df) == len(qc_buoy):
+            for col in numeric_cols:
+                if col in qc_buoy.columns:
+                    buoy_df.loc[qc_buoy[col].isin([2, 3, 4]), col] = np.nan
+    data = buoy_df[numeric_cols]
+    corr_matrix = data.corr(method='pearson')
+    labels = [PARAM_NAMES_CN.get(col, col) for col in corr_matrix.columns]
+    text_matrix = corr_matrix.values.copy()
+    for i in range(len(corr_matrix)):
+        for j in range(len(corr_matrix)):
+            if i == j:
+                text_matrix[i, j] = np.nan
+    fig = go.Figure(data=go.Heatmap(
+        z=corr_matrix.values,
+        x=labels,
+        y=labels,
+        zmin=-1,
+        zmax=1,
+        colorscale='RdBu_r',
+        reversescale=False,
+        hoverongaps=False,
+        hovertemplate='x: %{x}<br>y: %{y}<br>相关系数: %{z:.3f}<extra></extra>',
+        colorbar=dict(title='Pearson相关系数', titleside='right')
+    ))
+    annotations = []
+    for i, label in enumerate(labels):
+        annotations.append(dict(
+            x=label, y=label, text=f'<b>{label}</b>',
+            xref='x', yref='y', showarrow=False,
+            font=dict(size=10, color='black')
+        ))
+    fig.update_layout(
+        title=f'{buoy_id} - 多参数Pearson相关性热力图',
+        xaxis_title='',
+        yaxis_title='',
+        xaxis=dict(side='bottom', tickangle=-45),
+        yaxis=dict(autorange='reversed'),
+        template='plotly_white',
+        height=600,
+        annotations=annotations
+    )
+    return fig

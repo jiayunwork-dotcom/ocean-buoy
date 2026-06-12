@@ -47,6 +47,7 @@ class QCResult:
     qc_codes: pd.DataFrame = None
     manual_overrides: Dict[Tuple[str, pd.Timestamp, str], Tuple[int, str]] = field(default_factory=dict)
     level_stats: Dict = field(default_factory=dict)
+    level_marks: pd.DataFrame = None
     
     def get_final_code(self, buoy_id: str, time: pd.Timestamp, param: str) -> int:
         key = (buoy_id, time, param)
@@ -57,6 +58,15 @@ class QCResult:
             if mask.any():
                 return int(self.qc_codes.loc[mask, param].values[0])
         return QC_UNCHECKED
+    
+    def get_mark_level(self, buoy_id: str, time: pd.Timestamp, param: str) -> int:
+        if self.level_marks is not None:
+            mask = (self.level_marks['buoy_id'] == buoy_id) & (self.level_marks['time'] == time)
+            if mask.any():
+                val = self.level_marks.loc[mask, param].values[0]
+                if not pd.isna(val):
+                    return int(val)
+        return 0
 
 
 def init_qc_codes(df: pd.DataFrame) -> pd.DataFrame:
@@ -66,7 +76,15 @@ def init_qc_codes(df: pd.DataFrame) -> pd.DataFrame:
     return qc_df
 
 
-def qc_level1_range(df: pd.DataFrame, qc_df: pd.DataFrame, thresholds: Dict = None) -> pd.DataFrame:
+def init_level_marks(df: pd.DataFrame) -> pd.DataFrame:
+    lm_df = df[['time', 'buoy_id']].copy()
+    for param in PARAMETERS:
+        lm_df[param] = np.nan
+    return lm_df
+
+
+def qc_level1_range(df: pd.DataFrame, qc_df: pd.DataFrame, thresholds: Dict = None,
+                     level_marks: pd.DataFrame = None) -> pd.DataFrame:
     if thresholds is None:
         thresholds = DEFAULT_RANGE_THRESHOLDS
     qc_df = qc_df.copy()
@@ -74,9 +92,12 @@ def qc_level1_range(df: pd.DataFrame, qc_df: pd.DataFrame, thresholds: Dict = No
         if param not in df.columns:
             continue
         mask_missing = df[param].isna()
-        mask_error = (~mask_missing) & ((df[param] < thresh['min']) | (df[param] > thresh['max']))
+        prev_not_error = qc_df[param] != QC_ERROR
+        mask_error = (~mask_missing) & prev_not_error & ((df[param] < thresh['min']) | (df[param] > thresh['max']))
         qc_df[param] = np.where(mask_missing, QC_MISSING,
                                np.where(mask_error, QC_ERROR, qc_df[param]))
+        if level_marks is not None and param in level_marks.columns:
+            level_marks.loc[mask_error & level_marks[param].isna(), param] = 1
     return qc_df
 
 
@@ -189,12 +210,16 @@ def qc_level4_climatology(df: pd.DataFrame, qc_df: pd.DataFrame,
     return qc_df
 
 
-def qc_level5_spike(df: pd.DataFrame, qc_df: pd.DataFrame, sigma: float = 3.0) -> pd.DataFrame:
+def qc_level5_spike(df: pd.DataFrame, qc_df: pd.DataFrame, sigma: float = 3.0,
+                     level_marks: pd.DataFrame = None) -> pd.DataFrame:
     qc_df = qc_df.copy()
     for buoy_id in df['buoy_id'].unique():
         buoy_mask = df['buoy_id'] == buoy_id
         buoy_df = df.loc[buoy_mask].sort_values('time')
         buoy_qc = qc_df.loc[buoy_mask].sort_values('time').copy()
+        lm_buoy = None
+        if level_marks is not None:
+            lm_buoy = level_marks.loc[buoy_mask].sort_values('time')
         for param in PARAMETERS:
             if param not in buoy_df.columns:
                 continue
@@ -216,6 +241,10 @@ def qc_level5_spike(df: pd.DataFrame, qc_df: pd.DataFrame, sigma: float = 3.0) -
                     continue
                 if diff_prev > sigma * local_std and diff_next > sigma * local_std and diff_neighbors < sigma * local_std:
                     qc_values[i] = QC_ERROR
+                    if lm_buoy is not None and param in lm_buoy.columns:
+                        idx = buoy_qc.index[i]
+                        if pd.isna(level_marks.loc[idx, param]):
+                            level_marks.loc[idx, param] = 5
             qc_df.loc[buoy_qc.index, param] = qc_values
     return qc_df
 
@@ -324,9 +353,10 @@ def run_full_qc(df: pd.DataFrame,
                 spike_sigma: float = 3.0,
                 stuck_n: int = 6) -> QCResult:
     qc_df = init_qc_codes(df)
+    level_marks = init_level_marks(df)
     level_stats = {}
     
-    qc_df = qc_level1_range(df, qc_df, range_thresholds)
+    qc_df = qc_level1_range(df, qc_df, range_thresholds, level_marks)
     level_stats[1] = count_qc_codes(qc_df)
     
     qc_df = qc_level2_temporal(df, qc_df, gradient_thresholds)
@@ -338,7 +368,7 @@ def run_full_qc(df: pd.DataFrame,
     qc_df = qc_level4_climatology(df, qc_df, climatology)
     level_stats[4] = count_qc_codes(qc_df)
     
-    qc_df = qc_level5_spike(df, qc_df, spike_sigma)
+    qc_df = qc_level5_spike(df, qc_df, spike_sigma, level_marks)
     level_stats[5] = count_qc_codes(qc_df)
     
     qc_df = qc_level6_stuck(df, qc_df, stuck_n)
@@ -352,7 +382,7 @@ def run_full_qc(df: pd.DataFrame,
             unmarked = qc_df[param] == QC_UNCHECKED
             qc_df.loc[unmarked & df[param].notna(), param] = QC_GOOD
     
-    return QCResult(qc_codes=qc_df, manual_overrides={}, level_stats=level_stats)
+    return QCResult(qc_codes=qc_df, manual_overrides={}, level_stats=level_stats, level_marks=level_marks)
 
 
 def count_qc_codes(qc_df: pd.DataFrame) -> Dict[str, Dict[int, int]]:
