@@ -6,6 +6,9 @@ import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from io import BytesIO
 
+from .plot_utils import setup_chinese_font
+setup_chinese_font()
+
 from .quality_control import QC_MISSING, QC_INTERPOLATED, QC_GOOD, PARAMETERS
 
 

@@ -32,13 +32,13 @@ DEFAULT_RANGE_THRESHOLDS = {
 }
 
 DEFAULT_GRADIENT_THRESHOLDS = {
-    'wind_speed': 15.0,
-    'air_temp': 5.0,
-    'pressure': 10.0,
-    'Hs': 3.0,
-    'SST': 3.0,
-    'salinity': 2.0,
-    'current_speed': 2.0
+    'wind_speed': 20.0,
+    'air_temp': 10.0,
+    'pressure': 15.0,
+    'Hs': 5.0,
+    'SST': 5.0,
+    'salinity': 3.0,
+    'current_speed': 3.0
 }
 
 
@@ -142,19 +142,25 @@ def qc_level3_internal(df: pd.DataFrame, qc_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def qc_level4_climatology(df: pd.DataFrame, qc_df: pd.DataFrame,
-                          climatology: Optional[Dict] = None) -> pd.DataFrame:
+                          climatology: Optional[Dict] = None,
+                          min_years: int = 3) -> pd.DataFrame:
     qc_df = qc_df.copy()
     if climatology is None:
         climatology = {}
         for buoy_id in df['buoy_id'].unique():
             buoy_df = df[df['buoy_id'] == buoy_id].copy()
+            years_covered = buoy_df['time'].dt.year.nunique()
+            if years_covered < min_years:
+                continue
             buoy_df['month'] = buoy_df['time'].dt.month
             climatology[buoy_id] = {}
             for param in PARAMETERS:
                 if param not in buoy_df.columns:
                     continue
                 clim = buoy_df.groupby('month')[param].agg(['mean', 'std'])
-                climatology[buoy_id][param] = clim
+                valid_months = clim.dropna().index.nunique()
+                if valid_months >= 6:
+                    climatology[buoy_id][param] = clim
     for buoy_id in df['buoy_id'].unique():
         if buoy_id not in climatology:
             continue

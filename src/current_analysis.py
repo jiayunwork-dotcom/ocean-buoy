@@ -5,6 +5,9 @@ from typing import Dict, Tuple, Optional, List
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 
+from .plot_utils import setup_chinese_font
+setup_chinese_font()
+
 TIDAL_CONSTITUENTS = {
     'M2': 12.4206, 'S2': 12.0, 'N2': 12.6583, 'K2': 11.9672,
     'K1': 23.9345, 'O1': 25.8193, 'P1': 24.0659, 'Q1': 26.8683

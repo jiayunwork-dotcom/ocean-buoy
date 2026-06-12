@@ -31,10 +31,11 @@ def compute_spectral_moments(freqs: np.ndarray, psd: np.ndarray) -> Dict[str, fl
     f = freqs[positive]
     s = psd[positive]
     df = np.diff(f, prepend=f[0])
-    m0 = np.trapz(s, f)
-    m1 = np.trapz(s * f, f)
-    m2 = np.trapz(s * f**2, f)
-    m4 = np.trapz(s * f**4, f)
+    trapz = np.trapezoid if hasattr(np, 'trapezoid') else np.trapz
+    m0 = trapz(s, f)
+    m1 = trapz(s * f, f)
+    m2 = trapz(s * f**2, f)
+    m4 = trapz(s * f**4, f)
     return {'m0': m0, 'm1': m1, 'm2': m2, 'm4': m4}
 
 

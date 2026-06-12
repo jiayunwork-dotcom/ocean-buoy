@@ -5,6 +5,9 @@ import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 import matplotlib.cm as cm
 
+from .plot_utils import setup_chinese_font
+setup_chinese_font()
+
 
 def wind_rose(wind_speed: np.ndarray, wind_dir: np.ndarray, n_sectors: int = 16,
               speed_bins: List[float] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:

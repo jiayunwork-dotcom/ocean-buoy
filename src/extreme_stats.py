@@ -5,6 +5,9 @@ from typing import Dict, Tuple, Optional, List
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 
+from .plot_utils import setup_chinese_font
+setup_chinese_font()
+
 RETURN_PERIODS = [10, 25, 50, 100]
 
 
