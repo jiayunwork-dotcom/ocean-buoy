@@ -210,21 +210,29 @@ def plot_param_correlation_heatmap(df: pd.DataFrame, buoy_id: str, qc_mask: Opti
     data = buoy_df[numeric_cols]
     corr_matrix = data.corr(method='pearson')
     labels = [PARAM_NAMES_CN.get(col, col) for col in corr_matrix.columns]
-    text_matrix = corr_matrix.values.copy()
+    z_display = corr_matrix.values.copy()
+    hover_text = []
     for i in range(len(corr_matrix)):
+        row_text = []
         for j in range(len(corr_matrix)):
             if i == j:
-                text_matrix[i, j] = np.nan
+                row_text.append(f'{labels[i]} vs {labels[j]}<br>自身相关')
+            else:
+                row_text.append(f'{labels[i]} vs {labels[j]}<br>相关系数: {corr_matrix.values[i, j]:.3f}')
+        hover_text.append(row_text)
+    for i in range(len(corr_matrix)):
+        z_display[i, i] = np.nan
     fig = go.Figure(data=go.Heatmap(
-        z=corr_matrix.values,
+        z=z_display,
         x=labels,
         y=labels,
         zmin=-1,
         zmax=1,
         colorscale='RdBu_r',
         reversescale=False,
-        hoverongaps=False,
-        hovertemplate='x: %{x}<br>y: %{y}<br>相关系数: %{z:.3f}<extra></extra>',
+        hoverongaps=True,
+        text=hover_text,
+        hoverinfo='text',
         colorbar=dict(title='Pearson相关系数', titleside='right')
     ))
     annotations = []

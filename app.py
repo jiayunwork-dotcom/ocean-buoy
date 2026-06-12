@@ -119,7 +119,20 @@ elif page == "🔍 质量控制":
                         st.error("❌ JSON格式错误：缺少必要键(range_thresholds, gradient_thresholds, spike_sigma, stuck_n)")
                     else:
                         st.session_state.imported_config = config_data
-                        st.success("✅ 配置导入成功！点击运行质控应用新配置")
+                        for param, thresh in config_data.get('range_thresholds', {}).items():
+                            if f"range_min_{param}" in st.session_state:
+                                st.session_state[f"range_min_{param}"] = float(thresh.get('min', DEFAULT_RANGE_THRESHOLDS.get(param, {}).get('min', 0)))
+                            if f"range_max_{param}" in st.session_state:
+                                st.session_state[f"range_max_{param}"] = float(thresh.get('max', DEFAULT_RANGE_THRESHOLDS.get(param, {}).get('max', 100)))
+                        for param, val in config_data.get('gradient_thresholds', {}).items():
+                            if f"grad_{param}" in st.session_state:
+                                st.session_state[f"grad_{param}"] = float(val)
+                        if 'spike_sigma_input' in st.session_state:
+                            st.session_state['spike_sigma_input'] = float(config_data['spike_sigma'])
+                        if 'stuck_n_input' in st.session_state:
+                            st.session_state['stuck_n_input'] = int(config_data['stuck_n'])
+                        st.success("✅ 配置导入成功！参数已更新")
+                        st.rerun()
                 except json.JSONDecodeError as e:
                     st.error(f"❌ JSON解析失败：{str(e)}")
                 except Exception as e:
@@ -153,36 +166,28 @@ elif page == "🔍 质量控制":
         with col1:
             with st.expander("📏 范围检查阈值 (第1级)"):
                 range_thresholds = {}
-                imported = st.session_state.get('imported_config', {})
-                imported_range = imported.get('range_thresholds', {})
                 for param, thresh in DEFAULT_RANGE_THRESHOLDS.items():
                     c1, c2 = st.columns(2)
-                    min_val = imported_range.get(param, {}).get('min', thresh['min'])
-                    max_val = imported_range.get(param, {}).get('max', thresh['max'])
                     range_thresholds[param] = {
-                        'min': c1.number_input(f"{param} 下限", value=min_val, key=f"range_min_{param}"),
-                        'max': c2.number_input(f"{param} 上限", value=max_val, key=f"range_max_{param}")
+                        'min': c1.number_input(f"{param} 下限", value=thresh['min'], key=f"range_min_{param}"),
+                        'max': c2.number_input(f"{param} 上限", value=thresh['max'], key=f"range_max_{param}")
                     }
         with col2:
             with st.expander("📈 时间一致性阈值 (第2级)"):
                 gradient_thresholds = {}
-                imported = st.session_state.get('imported_config', {})
-                imported_grad = imported.get('gradient_thresholds', {})
                 for param, thresh in DEFAULT_GRADIENT_THRESHOLDS.items():
-                    grad_val = imported_grad.get(param, thresh)
                     gradient_thresholds[param] = st.number_input(
-                        f"{param} 1小时最大变化", value=grad_val, key=f"grad_{param}"
+                        f"{param} 1小时最大变化", value=thresh, key=f"grad_{param}"
                     )
         st.subheader("高级质控参数")
         col3, col4, col5 = st.columns(3)
-        imported = st.session_state.get('imported_config', {})
         with col3:
             spike_sigma = st.number_input("尖峰检测σ阈值 (第5级)", 
-                                           value=imported.get('spike_sigma', 3.0), 
+                                           value=3.0, 
                                            min_value=1.0, max_value=10.0, key="spike_sigma_input")
         with col4:
             stuck_n = st.number_input("卡值检测连续点数 (第6级)", 
-                                       value=int(imported.get('stuck_n', 6)), 
+                                       value=6, 
                                        min_value=3, max_value=20, key="stuck_n_input")
         with col5:
             st.info("空间一致性检查(第7级): 需至少2个浮标")

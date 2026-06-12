@@ -163,17 +163,18 @@ def compute_wave_monthly_stats(df: pd.DataFrame, buoy_id: str, qc_mask: Optional
             hs[hs_qc['Hs'].isin([2, 3, 4])] = np.nan
     buoy_df['Hs_valid'] = hs.values
     buoy_df['year_month'] = buoy_df['time'].dt.to_period('M')
+    buoy_df['date'] = buoy_df['time'].dt.date
     monthly = buoy_df.groupby('year_month').agg(
         avg_hs=('Hs_valid', 'mean'),
         max_hs=('Hs_valid', 'max'),
         std_hs=('Hs_valid', 'std'),
-        valid_count=('Hs_valid', 'count'),
-        over_2m_count=('Hs_valid', lambda x: (x > 2).sum())
+        valid_days=('date', 'nunique')
     ).reset_index()
-    monthly['valid_days'] = buoy_df.groupby('year_month')['time'].apply(
-        lambda x: x.dt.date.nunique()
-    ).values
-    monthly['over_2m_ratio'] = monthly['over_2m_count'] / monthly['valid_count'].where(monthly['valid_count'] > 0, 1)
+    over_2m_days = buoy_df[buoy_df['Hs_valid'] > 2].groupby('year_month')['date'].nunique()
+    monthly['over_2m_days'] = monthly['year_month'].map(
+        lambda ym: over_2m_days.get(ym, 0)
+    )
+    monthly['over_2m_ratio'] = monthly['over_2m_days'] / monthly['valid_days'].where(monthly['valid_days'] > 0, 1)
     monthly['year_month_str'] = monthly['year_month'].astype(str)
     monthly = monthly.rename(columns={
         'year_month_str': '月份',
