@@ -43,7 +43,11 @@ from src.warning_engine import (
     get_builtin_templates, make_unique_name, import_templates,
     scan_warnings, events_to_dataframe,
     compute_level_counts, compute_buoy_counts, compute_hourly_heatmap,
-    serialize_rules, deserialize_rules
+    serialize_rules, deserialize_rules,
+    apply_escalation, build_composite_groups,
+    detect_cycle_dependency, get_prerequisite_chain,
+    compute_daily_trend, compute_daily_totals,
+    compute_7day_moving_avg, detect_anomaly_days
 )
 
 st.set_page_config(page_title="海洋浮标数据质控与海况分析系统", layout="wide")
@@ -62,6 +66,8 @@ if 'warning_events' not in st.session_state:
     st.session_state.warning_events = None
 if 'warning_events_df' not in st.session_state:
     st.session_state.warning_events_df = None
+if 'warning_composite_groups' not in st.session_state:
+    st.session_state.warning_composite_groups = []
 
 
 st.sidebar.header("导航")
@@ -659,11 +665,15 @@ elif page == "🚨 预警管理":
             rule_rows = []
             for idx, r in enumerate(rules):
                 level_info = WARNING_LEVELS.get(r.level, {})
+                dep_str = ""
+                if r.prerequisite_rule:
+                    dep_str = f"← {r.prerequisite_rule}"
                 rule_rows.append({
                     '序号': idx + 1,
                     '规则名称': r.name,
                     '预警级别': level_info.get('name', f'L{r.level}'),
                     '触发条件': r.describe_conditions(),
+                    '前置规则': dep_str if dep_str else "无",
                     '状态': '✅ 启用' if r.enabled else '⏸️ 禁用',
                     'level_val': r.level,
                     'color': level_info.get('color', '#888888')
@@ -728,6 +738,7 @@ elif page == "🚨 预警管理":
             default_duration = default_rule.duration_minutes if default_rule else 0
             default_enabled = default_rule.enabled if default_rule else True
             default_conditions = default_rule.conditions if default_rule else []
+            default_prerequisite = default_rule.prerequisite_rule if default_rule else None
 
             with st.form(form_key, clear_on_submit=True):
                 st.markdown("**规则基本信息**")
@@ -744,6 +755,21 @@ elif page == "🚨 预警管理":
                 new_duration = c3.number_input("持续时间(分钟)", min_value=0, max_value=1440, value=default_duration,
                                                 help="0表示无需持续，单条满足即触发")
                 new_enabled = c4.checkbox("启用规则", value=default_enabled)
+
+                st.markdown("**前置依赖规则**")
+                existing_rule_names = [r.name for j, r in enumerate(st.session_state.warning_rules)
+                                       if not is_edit or j != selected_edit_idx]
+                prereq_options = ["无"] + existing_rule_names
+                default_prereq_idx = 0
+                if default_prerequisite and default_prerequisite in prereq_options:
+                    default_prereq_idx = prereq_options.index(default_prerequisite)
+                new_prereq = st.selectbox(
+                    "前置规则（单选，可不选）",
+                    range(len(prereq_options)),
+                    index=default_prereq_idx,
+                    format_func=lambda i: prereq_options[i],
+                    help="设置了前置规则的规则只有在前置规则已触发时才会被检测"
+                )
 
                 st.markdown("**触发条件（所有条件需同时满足）**")
                 cond_count_key = f"{form_key}_cond_count"
@@ -817,14 +843,24 @@ elif page == "🚨 预警管理":
                             st.error("❌ 规则名称已存在，请使用其他名称")
                             valid_form = False
 
+                    selected_prereq = prereq_options[new_prereq] if new_prereq > 0 else None
+                    if valid_form and selected_prereq is not None:
+                        temp_rules = [r for j, r in enumerate(st.session_state.warning_rules)
+                                      if not is_edit or j != selected_edit_idx]
+                        if detect_cycle_dependency(temp_rules, new_name.strip(), selected_prereq):
+                            st.error("❌ 检测到循环依赖！设置此外前置规则会导致循环依赖，请重新选择")
+                            valid_form = False
+
                     if valid_form:
                         level_val = level_options[new_level]
+                        selected_prereq_val = prereq_options[new_prereq] if new_prereq > 0 else None
                         new_rule = WarningRule(
                             name=new_name.strip(),
                             level=level_val,
                             conditions=new_conditions,
                             duration_minutes=int(new_duration),
-                            enabled=new_enabled
+                            enabled=new_enabled,
+                            prerequisite_rule=selected_prereq_val
                         )
                         if is_edit:
                             st.session_state.warning_rules[selected_edit_idx] = new_rule
@@ -856,6 +892,7 @@ elif page == "🚨 预警管理":
             if clear_btn:
                 st.session_state.warning_events = None
                 st.session_state.warning_events_df = None
+                st.session_state.warning_composite_groups = []
                 st.rerun()
         with col_scan3:
             enabled_count = len([r for r in st.session_state.warning_rules if r.enabled])
@@ -876,9 +913,13 @@ elif page == "🚨 预警管理":
                         st.session_state.warning_rules,
                         st.session_state.qc_result.qc_codes if st.session_state.qc_result else None
                     )
+                    events = apply_escalation(events, st.session_state.warning_rules)
+                    events, composite_groups = build_composite_groups(events)
                     st.session_state.warning_events = events
                     st.session_state.warning_events_df = events_to_dataframe(events)
-                    st.success(f"✅ 扫描完成！共检测到 {len(events)} 个预警事件")
+                    st.session_state.warning_composite_groups = composite_groups
+                    group_count = len(composite_groups)
+                    st.success(f"✅ 扫描完成！共检测到 {len(events)} 个预警事件，{group_count} 个复合事件组")
 
         events_df = st.session_state.warning_events_df
         if events_df is None or len(events_df) == 0:
@@ -890,12 +931,13 @@ elif page == "🚨 预警管理":
             st.success(f"共检测到 **{len(events_df)}** 个预警事件")
             st.divider()
             st.subheader("事件筛选")
-            col_f1, col_f2 = st.columns(2)
-            all_levels = ['全部'] + sorted(events_df['level'].unique().tolist())
+            col_f1, col_f2, col_f3 = st.columns(3)
+            eff_levels = sorted(events_df['effective_level'].unique().tolist()) if 'effective_level' in events_df.columns else sorted(events_df['level'].unique().tolist())
+            all_levels = ['全部'] + eff_levels
             level_labels = ['全部'] + [f"L{l} - {WARNING_LEVELS.get(l, {}).get('name', '')}" for l in all_levels if l != '全部']
             with col_f1:
                 sel_level_idx = st.selectbox(
-                    "按预警级别筛选",
+                    "按有效级别筛选",
                     range(len(all_levels)),
                     format_func=lambda i: level_labels[i],
                     key="event_filter_level"
@@ -907,12 +949,22 @@ elif page == "🚨 预警管理":
                     all_buoys,
                     key="event_filter_buoy"
                 )
+            all_tags = ['全部', '↑升级', '↓原始']
+            with col_f3:
+                sel_tag = st.selectbox(
+                    "按升降级标签筛选",
+                    all_tags,
+                    key="event_filter_tag"
+                )
 
             filtered = events_df.copy()
+            level_col = 'effective_level' if 'effective_level' in filtered.columns else 'level'
             if all_levels[sel_level_idx] != '全部':
-                filtered = filtered[filtered['level'] == all_levels[sel_level_idx]]
+                filtered = filtered[filtered[level_col] == all_levels[sel_level_idx]]
             if sel_buoy != '全部':
                 filtered = filtered[filtered['buoy_id'] == sel_buoy]
+            if sel_tag != '全部' and 'level_tag' in filtered.columns:
+                filtered = filtered[filtered['level_tag'] == sel_tag]
 
             if len(filtered) == 0:
                 st.warning("筛选条件下无事件")
@@ -920,9 +972,9 @@ elif page == "🚨 预警管理":
                 st.markdown(f"显示 **{len(filtered)}** 条事件")
 
                 def _row_style(row):
-                    lv = row['level']
-                    bg = WARNING_LEVELS.get(lv, {}).get('bg_color', '#ffffff')
-                    if lv >= 3:
+                    eff_lv = row.get('effective_level', row['level'])
+                    bg = WARNING_LEVELS.get(eff_lv, {}).get('bg_color', '#ffffff')
+                    if eff_lv >= 3:
                         return [f'background-color:{bg};font-weight:bold' for _ in row]
                     return [f'background-color:{bg}' for _ in row]
 
@@ -930,14 +982,17 @@ elif page == "🚨 预警管理":
                 display['触发时间'] = display['start_time'].dt.strftime('%Y-%m-%d %H:%M')
                 display['结束时间'] = display['end_time'].dt.strftime('%Y-%m-%d %H:%M')
                 display['持续(分钟)'] = display['duration_minutes']
-                display['预警级别'] = display.apply(
-                    lambda r: f"{WARNING_LEVELS.get(r['level'], {}).get('name', '')}", axis=1
+                eff_col = 'effective_level' if 'effective_level' in display.columns else 'level'
+                eff_name_col = 'effective_level_name' if 'effective_level_name' in display.columns else 'level_name'
+                display['有效级别'] = display.apply(
+                    lambda r: f"{r.get(eff_name_col, WARNING_LEVELS.get(r.get(eff_col, r['level']), {}).get('name', ''))} {r.get('level_tag', '')}", axis=1
                 )
                 display['参数快照'] = display['param_snapshot'].apply(
                     lambda d: " | ".join([f"{PARAM_NAMES_CN.get(k, k)}: {v:.2f}" if pd.notna(v) else f"{PARAM_NAMES_CN.get(k, k)}: N/A"
                                           for k, v in d.items()])
                 )
-                show_cols = ['event_id', 'rule_name', '预警级别', 'buoy_id', '触发时间', '结束时间', '持续(分钟)', '参数快照']
+                display['复合组'] = display['group_id'].apply(lambda x: x if pd.notna(x) else "-")
+                show_cols = ['event_id', 'rule_name', '有效级别', 'buoy_id', '触发时间', '结束时间', '持续(分钟)', '复合组', '参数快照']
                 show_cols_rename = {
                     'event_id': '事件ID',
                     'rule_name': '触发规则',
@@ -946,6 +1001,44 @@ elif page == "🚨 预警管理":
                 display_final = display[show_cols].rename(columns=show_cols_rename)
                 styled_final = display_final.style.apply(_row_style, axis=1)
                 st.dataframe(styled_final, use_container_width=True, height=500)
+
+                composite_groups = st.session_state.warning_composite_groups
+                if composite_groups:
+                    st.divider()
+                    st.subheader("🔗 复合事件组")
+                    for grp in composite_groups:
+                        max_lv = grp['max_level']
+                        max_lv_info = WARNING_LEVELS.get(max_lv, {})
+                        max_lv_color = max_lv_info.get('color', '#888')
+                        max_lv_name = max_lv_info.get('name', '')
+                        time_range = f"{grp['start_time'].strftime('%Y-%m-%d %H:%M')} ~ {grp['end_time'].strftime('%Y-%m-%d %H:%M')}"
+                        title = f"{grp['group_id']} | {max_lv_name}预警 | {grp['rule_count']}条规则 | {time_range}"
+                        with st.expander(f"🔗 {title}"):
+                            for sub_ev in grp['events']:
+                                sub_lv = sub_ev.effective_level
+                                sub_lv_info = WARNING_LEVELS.get(sub_lv, {})
+                                sub_color = sub_lv_info.get('color', '#888')
+                                sub_bg = sub_lv_info.get('bg_color', '#fff')
+                                tag_str = sub_ev.level_tag
+                                param_html = ""
+                                for pk, pv in sub_ev.param_snapshot.items():
+                                    cn_name = PARAM_NAMES_CN.get(pk, pk)
+                                    val_str = f"{pv:.3f}" if pd.notna(pv) else "N/A"
+                                    param_html += f'<span style="margin-right:12px;">{cn_name}: <b>{val_str}</b></span>'
+                                dur_str = f"{sub_ev.duration_minutes}分钟" if sub_ev.duration_minutes > 0 else "瞬时触发"
+                                sub_card = f"""
+                                <div style="border:1px solid {sub_color};border-radius:8px;padding:12px;margin-bottom:8px;background:{sub_bg};">
+                                    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                                        <span style="font-weight:bold;">{sub_ev.rule_name}</span>
+                                        <span style="background:{sub_color};color:white;padding:2px 8px;border-radius:4px;font-size:12px;">{sub_lv_info.get('name', '')}</span>
+                                        <span style="background:#e0e0e0;color:#333;padding:2px 8px;border-radius:4px;font-size:12px;">{tag_str}</span>
+                                        <span style="font-size:13px;">⏰ {sub_ev.start_time.strftime('%Y-%m-%d %H:%M')}</span>
+                                        <span style="font-size:13px;">📏 {dur_str}</span>
+                                    </div>
+                                    <div style="font-size:12px;margin-top:6px;">📊 {param_html}</div>
+                                </div>
+                                """
+                                st.markdown(sub_card, unsafe_allow_html=True)
 
                 st.divider()
                 st.subheader("📜 事件卡片详情")
@@ -959,11 +1052,13 @@ elif page == "🚨 预警管理":
                 st.markdown(f"第 **{current_page}/{total_pages}** 页，显示 **{start+1}-{end}** 条")
 
                 for _, ev in page_data.iterrows():
-                    lv = int(ev['level'])
-                    level_info = WARNING_LEVELS.get(lv, {})
-                    color = level_info.get('color', '#888')
-                    bg = level_info.get('bg_color', '#fff')
-                    border_style = f'3px solid {color}' if lv >= 3 else f'1px solid {color}'
+                    eff_lv = int(ev.get('effective_level', ev['level']))
+                    orig_lv = int(ev['level'])
+                    eff_level_info = WARNING_LEVELS.get(eff_lv, {})
+                    orig_level_info = WARNING_LEVELS.get(orig_lv, {})
+                    color = eff_level_info.get('color', '#888')
+                    bg = eff_level_info.get('bg_color', '#fff')
+                    border_style = f'3px solid {color}' if eff_lv >= 3 else f'1px solid {color}'
                     param_html = ""
                     for pk, pv in ev['param_snapshot'].items():
                         cn_name = PARAM_NAMES_CN.get(pk, pk)
@@ -971,14 +1066,33 @@ elif page == "🚨 预警管理":
                         param_html += f'<span style="margin-right:18px;">{cn_name}: <b>{val_str}</b></span>'
 
                     dur_str = f"{ev['duration_minutes']}分钟" if ev['duration_minutes'] > 0 else "瞬时触发"
+                    tag_html = ""
+                    level_tag = ev.get('level_tag', '')
+                    if level_tag == '↑升级':
+                        tag_html = f'<span style="background:#FF4444;color:white;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:bold;">↑升级</span>'
+                        level_detail = f"{orig_level_info.get('name', '')}→{eff_level_info.get('name', '')}"
+                    elif level_tag == '↓原始':
+                        tag_html = f'<span style="background:#999;color:white;padding:2px 8px;border-radius:4px;font-size:11px;">↓原始</span>'
+                        level_detail = ""
+                    else:
+                        level_detail = ""
+
+                    group_html = ""
+                    group_id = ev.get('group_id', None)
+                    if pd.notna(group_id) and group_id:
+                        group_html = f'<span style="background:#6A5ACD;color:white;padding:2px 8px;border-radius:5px;font-size:12px;">🔗 {group_id}</span>'
+
                     card = f"""
                     <div style="border:{border_style};border-radius:10px;padding:16px;margin-bottom:12px;background:{bg};box-shadow:0 2px 4px rgba(0,0,0,0.05);">
                         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;flex-wrap:wrap;gap:8px;">
                             <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
                                 <span style="background:#333;color:white;padding:3px 10px;border-radius:5px;font-size:13px;font-weight:bold;">#{ev['event_id']}</span>
                                 <span style="font-weight:bold;font-size:16px;">{ev['rule_name']}</span>
-                                <span style="background:{color};color:white;padding:3px 12px;border-radius:5px;font-size:13px;font-weight:bold;">{level_info.get('name', '')}预警</span>
+                                <span style="background:{color};color:white;padding:3px 12px;border-radius:5px;font-size:13px;font-weight:bold;">{eff_level_info.get('name', '')}预警</span>
+                                {tag_html}
+                                <span style="font-size:12px;color:#666;">{level_detail}</span>
                                 <span style="background:#666;color:white;padding:3px 10px;border-radius:5px;font-size:12px;">🚩 {ev['buoy_id']}</span>
+                                {group_html}
                             </div>
                         </div>
                         <div style="display:flex;gap:24px;font-size:14px;margin-bottom:10px;flex-wrap:wrap;">
@@ -999,24 +1113,28 @@ elif page == "🚨 预警管理":
         if stats_df is None or len(stats_df) == 0:
             st.info("暂无统计数据，请先在【预警事件列表】中执行扫描")
         else:
-            sc1, sc2, sc3, sc4, sc5 = st.columns(5)
+            eff_col = 'effective_level' if 'effective_level' in stats_df.columns else 'level'
+            sc1, sc2, sc3, sc4, sc5, sc6 = st.columns(6)
             total = len(stats_df)
-            red_count = len(stats_df[stats_df['level'] == 4])
-            orange_count = len(stats_df[stats_df['level'] == 3])
-            yellow_count = len(stats_df[stats_df['level'] == 2])
-            blue_count = len(stats_df[stats_df['level'] == 1])
+            red_count = len(stats_df[stats_df[eff_col] == 4])
+            orange_count = len(stats_df[stats_df[eff_col] == 3])
+            yellow_count = len(stats_df[stats_df[eff_col] == 2])
+            blue_count = len(stats_df[stats_df[eff_col] == 1])
+            composite_groups = st.session_state.warning_composite_groups
+            group_count = len(composite_groups) if composite_groups else 0
             sc1.metric("🚨 总预警数", total)
             sc2.metric("🔴 红色", red_count)
             sc3.metric("🟠 橙色", orange_count)
             sc4.metric("🟡 黄色", yellow_count)
             sc5.metric("🔵 蓝色", blue_count)
+            sc6.metric("🔗 复合事件组", group_count)
 
             st.divider()
             chart_col1, chart_col2 = st.columns(2)
 
             with chart_col1:
-                st.markdown("**各级别预警数量分布**")
-                level_counts = compute_level_counts(stats_df)
+                st.markdown("**各级别预警数量分布（按有效级别）**")
+                level_counts = compute_level_counts(stats_df, use_effective=True)
                 if len(level_counts) > 0:
                     level_counts['label'] = level_counts.apply(
                         lambda r: f"L{r['level']} {r['level_name']}", axis=1
@@ -1046,7 +1164,7 @@ elif page == "🚨 预警管理":
                     for _, row in buoy_counts.iterrows():
                         bid = row['buoy_id']
                         buoy_df = stats_df[stats_df['buoy_id'] == bid]
-                        max_lv = buoy_df['level'].max()
+                        max_lv = buoy_df[eff_col].max()
                         bar_colors.append(WARNING_LEVELS.get(int(max_lv), {}).get('color', '#4A90D9'))
 
                     fig_bar = go.Figure(data=[go.Bar(
@@ -1106,6 +1224,90 @@ elif page == "🚨 预警管理":
                     st.dataframe(display_heat.style.background_gradient(cmap='Reds', axis=None), use_container_width=True)
             else:
                 st.info("无数据")
+
+            st.divider()
+            st.subheader("📈 历史趋势")
+            daily_trend = compute_daily_trend(stats_df)
+            daily_totals = compute_daily_totals(stats_df)
+            ma_df = compute_7day_moving_avg(daily_totals)
+            anomaly_days = detect_anomaly_days(ma_df)
+
+            if len(daily_trend) > 0 or len(daily_totals) > 0:
+                fig_trend = go.Figure()
+
+                if len(daily_trend) > 0:
+                    sorted_levels = sorted(daily_trend['level'].unique())
+                    for lv in sorted_levels:
+                        lv_data = daily_trend[daily_trend['level'] == lv].sort_values('date')
+                        lv_info = WARNING_LEVELS.get(int(lv), {})
+                        fig_trend.add_trace(go.Scatter(
+                            x=lv_data['date'],
+                            y=lv_data['count'],
+                            name=f"L{int(lv)} {lv_info.get('name', '')}",
+                            mode='lines+markers',
+                            stackgroup='one',
+                            line=dict(color=lv_info.get('color', '#888')),
+                            hovertemplate=f'L{int(lv)} {lv_info.get("name", "")}<br>日期: %{{x}}<br>事件数: %{{y}}<extra></extra>'
+                        ))
+
+                if len(ma_df) > 0 and 'ma7' in ma_df.columns:
+                    fig_trend.add_trace(go.Scatter(
+                        x=ma_df['date'],
+                        y=ma_df['ma7'],
+                        name='7日滑动平均',
+                        mode='lines',
+                        line=dict(color='#333333', width=2, dash='dash'),
+                        hovertemplate='7日滑动平均<br>日期: %{x}<br>均值: %{y:.1f}<extra></extra>'
+                    ))
+
+                if anomaly_days:
+                    anomaly_df = ma_df[ma_df['date'].isin(anomaly_days)]
+                    fig_trend.add_trace(go.Scatter(
+                        x=anomaly_df['date'],
+                        y=anomaly_df['total_count'],
+                        name='异常',
+                        mode='markers',
+                        marker=dict(
+                            symbol='triangle-up',
+                            size=14,
+                            color='red',
+                            line=dict(width=2, color='darkred')
+                        ),
+                        hovertemplate='⚠️ 异常<br>日期: %{x}<br>事件数: %{y}<extra></extra>'
+                    ))
+
+                fig_trend.update_layout(
+                    height=500,
+                    xaxis_title="日期",
+                    yaxis_title="事件数",
+                    hovermode='x unified',
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                )
+                st.plotly_chart(fig_trend, use_container_width=True)
+
+                if anomaly_days:
+                    st.warning(f"⚠️ 检测到 {len(anomaly_days)} 个异常日（事件数超过7日均值的2倍）")
+                    for ad in anomaly_days:
+                        row_data = ma_df[ma_df['date'] == ad]
+                        if len(row_data) > 0:
+                            cnt = int(row_data.iloc[0]['total_count'])
+                            avg = row_data.iloc[0]['ma7']
+                            st.markdown(f"  🔺 {ad}: {cnt}次事件 (7日均值: {avg:.1f})")
+
+                with st.expander("📋 查看趋势数据明细"):
+                    if len(ma_df) > 0:
+                        display_trend = ma_df.copy()
+                        display_trend['异常'] = display_trend['date'].apply(
+                            lambda d: '⚠️ 是' if d in anomaly_days else ''
+                        )
+                        display_trend['ma7'] = display_trend['ma7'].round(1)
+                        display_trend.columns = ['日期', '事件数', '7日滑动平均', '异常']
+                        st.dataframe(display_trend.style.apply(
+                            lambda row: ['background-color:#FFE6E6' if row['异常'] else '' for _ in row],
+                            axis=1
+                        ), use_container_width=True)
+            else:
+                st.info("数据不足，无法生成趋势图")
 
 elif page == "📄 报告生成":
     st.header("PDF海况分析报告")
