@@ -154,25 +154,25 @@ def analyze_meteorology_buoy(df: pd.DataFrame, buoy_id: str, qc_mask: Optional[p
     wd = buoy_df['wind_dir'].values.copy()
     if qc_mask is not None:
         qc_buoy = qc_mask[qc_mask['buoy_id'] == buoy_id].sort_values('time')
-        ws[qc_buoy['wind_speed'].isin([2, 3, 4]).values] = np.nan
-        wd[qc_buoy['wind_dir'].isin([2, 3, 4]).values] = np.nan
+        ws[qc_buoy['wind_speed'].isin([3, 4]).values] = np.nan
+        wd[qc_buoy['wind_dir'].isin([3, 4]).values] = np.nan
     valid_wind = np.sum(~(np.isnan(ws) | np.isnan(wd)))
-    if valid_wind > 100:
+    if valid_wind > 50:
         sectors, percentages, bins = wind_rose(ws, wd)
         result['wind_rose'] = plot_wind_rose(sectors, percentages, bins)
     pres = buoy_df['pressure'].values.copy()
     if qc_mask is not None:
         qc_buoy = qc_mask[qc_mask['buoy_id'] == buoy_id].sort_values('time')
-        pres[qc_buoy['pressure'].isin([2, 3, 4]).values] = np.nan
-    if np.sum(~np.isnan(pres)) > 100:
+        pres[qc_buoy['pressure'].isin([3, 4]).values] = np.nan
+    if np.sum(~np.isnan(pres)) > 50:
         low_p_events = detect_low_pressure(pd.DatetimeIndex(times), pres)
         result['pressure_plot'] = plot_pressure_trend(pd.DatetimeIndex(times), pres, low_p_events)
         result['low_pressure_events'] = low_p_events
-    if 'air_temp' in buoy_df.columns and buoy_df['air_temp'].notna().sum() > 100:
+    if 'air_temp' in buoy_df.columns and buoy_df['air_temp'].notna().sum() > 50:
         at = buoy_df['air_temp'].values.copy()
         if qc_mask is not None:
             qc_buoy = qc_mask[qc_mask['buoy_id'] == buoy_id].sort_values('time')
-            at[qc_buoy['air_temp'].isin([2, 3, 4]).values] = np.nan
+            at[qc_buoy['air_temp'].isin([3, 4]).values] = np.nan
         temp_df = buoy_df.copy()
         temp_df['air_temp'] = at
         result['temp_diurnal'] = plot_diurnal_variation(temp_df, 'air_temp')

@@ -80,7 +80,8 @@ def qc_level1_range(df: pd.DataFrame, qc_df: pd.DataFrame, thresholds: Dict = No
     return qc_df
 
 
-def qc_level2_temporal(df: pd.DataFrame, qc_df: pd.DataFrame, thresholds: Dict = None) -> pd.DataFrame:
+def qc_level2_temporal(df: pd.DataFrame, qc_df: pd.DataFrame, thresholds: Dict = None,
+                       window_hours: float = 1.0) -> pd.DataFrame:
     if thresholds is None:
         thresholds = DEFAULT_GRADIENT_THRESHOLDS
     qc_df = qc_df.copy()
@@ -88,25 +89,35 @@ def qc_level2_temporal(df: pd.DataFrame, qc_df: pd.DataFrame, thresholds: Dict =
         buoy_mask = df['buoy_id'] == buoy_id
         buoy_df = df.loc[buoy_mask].sort_values('time')
         buoy_qc = qc_df.loc[buoy_mask].sort_values('time')
-        if len(buoy_df) < 2:
+        if len(buoy_df) < 3:
             continue
-        for param, grad_thresh in thresholds.items():
+        times = pd.to_datetime(buoy_df['time'].values)
+        for param, change_thresh in thresholds.items():
             if param not in df.columns:
                 continue
             values = buoy_df[param].values
-            times = buoy_df['time'].values
             qc_values = buoy_qc[param].values.copy()
-            for i in range(1, len(values)):
-                if np.isnan(values[i]) or np.isnan(values[i-1]):
+            n = len(values)
+            j = 0
+            for i in range(n):
+                if np.isnan(values[i]) or qc_values[i] in [QC_ERROR, QC_MISSING]:
                     continue
-                if qc_values[i] == QC_MISSING or qc_values[i] == QC_ERROR:
+                window_end = times[i] + pd.Timedelta(hours=window_hours)
+                while j < n and times[j] <= window_end:
+                    j += 1
+                window_values = values[i:j]
+                if len(window_values) < 2:
                     continue
-                dt_hours = (times[i] - times[i-1]).astype('timedelta64[s]').astype(float) / 3600.0
-                if dt_hours <= 0:
+                valid_mask = ~np.isnan(window_values)
+                if valid_mask.sum() < 2:
                     continue
-                change_rate = abs(values[i] - values[i-1]) / dt_hours
-                if change_rate > grad_thresh:
-                    qc_values[i] = QC_SUSPECT
+                window_max = np.nanmax(window_values)
+                window_min = np.nanmin(window_values)
+                total_change = window_max - window_min
+                if total_change > change_thresh:
+                    for k in range(i, j):
+                        if not np.isnan(values[k]) and qc_values[k] not in [QC_ERROR, QC_MISSING]:
+                            qc_values[k] = QC_SUSPECT
             qc_df.loc[buoy_mask, param] = qc_values
     return qc_df
 

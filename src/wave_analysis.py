@@ -5,6 +5,9 @@ from typing import Dict, Tuple, Optional, List
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 
+from .plot_utils import setup_chinese_font
+setup_chinese_font()
+
 
 def welch_spectrum(hs_series: pd.Series, nperseg: int = 256, noverlap: int = None) -> Tuple[np.ndarray, np.ndarray]:
     if noverlap is None:

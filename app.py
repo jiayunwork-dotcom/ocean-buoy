@@ -10,6 +10,9 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from src.plot_utils import setup_chinese_font
+setup_chinese_font()
+
 from src.data_loader import (
     load_file, merge_buoy_data, get_data_overview, CSV_COLUMNS
 )

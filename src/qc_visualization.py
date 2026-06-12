@@ -5,6 +5,9 @@ from matplotlib.figure import Figure
 from typing import Dict, Tuple, Optional, List
 import matplotlib.colors as mcolors
 
+from .plot_utils import setup_chinese_font
+setup_chinese_font()
+
 from .quality_control import (
     QC_UNCHECKED, QC_GOOD, QC_SUSPECT, QC_ERROR, QC_MISSING, QC_INTERPOLATED, PARAMETERS
 )
